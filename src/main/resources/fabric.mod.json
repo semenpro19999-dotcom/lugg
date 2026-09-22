@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "id": "lugg",
+  "version": "${version}",
+  "name": "Lugg AI Assistant",
+  "description": "ИИ-помощник в Minecraft — нажми J чтобы открыть меню и попросить ИИ построить, создать предмет, сделать катсцену, озвучить или собрать любой сложный механизм.",
+  "authors": [
+    "Lugg Team"
+  ],
+  "contact": {
+    "repo": "https://github.com/semenpro19999-dotcom/lugg"
+  },
+  "license": "MIT",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "com.lugg.mod.LuggMod"
+    ],
+    "client": [
+      "com.lugg.mod.LuggModClient"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.14.24",
+    "minecraft": "~1.20.1",
+    "java": ">=17",
+    "fabric-api": "*"
+  }
+}
