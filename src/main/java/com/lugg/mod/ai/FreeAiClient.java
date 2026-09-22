@@ -1,7 +1,6 @@
 package com.lugg.mod.ai;
 
 import com.google.gson.Gson;
-import com.google.gson.JsonObject;
 import com.lugg.mod.LuggMod;
 import com.lugg.mod.ai.actions.ActionParser;
 import com.lugg.mod.ai.actions.ParsedPlan;
@@ -26,6 +25,9 @@ public class FreeAiClient {
             .followRedirects(HttpClient.Redirect.NORMAL)
             .build();
 
+    /** Максимальное время ожидания после 429, сек. */
+    private static final long MAX_RATE_WAIT_SEC = 20;
+
     public static void sendRequest(String taskType, String prompt) {
         AiRequestState state = AiRequestState.INSTANCE;
         state.reset();
@@ -41,7 +43,6 @@ public class FreeAiClient {
             state.log("§7Запрос: " + prompt.substring(0, Math.min(100, prompt.length())));
             state.log("");
 
-            // Список разных бесплатных провайдеров и моделей для перебора
             List<Provider> providers = List.of(
                     new Provider("OmniRoute Llama 3.1 8b", "https://api.omniroute.ai/v1/chat/completions", "llama-3.1-8b-instruct", true),
                     new Provider("OmniRoute Mistral 7b", "https://api.omniroute.ai/v1/chat/completions", "mistral-7b-instruct", true),
@@ -53,100 +54,28 @@ public class FreeAiClient {
 
             for (int i = 0; i < providers.size(); i++) {
                 Provider p = providers.get(i);
-                state.log("§e[" + (i+1) + "/" + providers.size() + "] " + p.name + "...");
+                state.log("§e[" + (i + 1) + "/" + providers.size() + "] " + p.name + "...");
 
-                try {
-                    List<Map<String, String>> messages = List.of(
-                            Map.of("role", "system", "content", systemPrompt),
-                            Map.of("role", "user", "content", prompt)
-                    );
-
-                    HttpResponse<String> response;
-                    if (p.usePost) {
-                        String body = GSON.toJson(Map.of(
-                                "model", p.model,
-                                "messages", messages,
-                                "stream", false,
-                                "temperature", 0.6,
-                                "max_tokens", 2048
-                        ));
-                        HttpRequest.Builder rb = HttpRequest.newBuilder()
-                                .uri(URI.create(p.url))
-                                .header("Content-Type", "application/json")
-                                .header("User-Agent", "Mozilla/5.0")
-                                .header("Accept", "application/json")
-                                .timeout(Duration.ofSeconds(35));
-                        // Для OmniRoute публичный бесплатный ключ, для Pollinations заголовки сайта
-                        if (p.url.contains("omniroute.ai")) {
-                            rb.header("Authorization", "Bearer omni-78c32bf3c1");
-                        } else {
-                            rb.header("Origin", "https://pollinations.ai").header("Referer", "https://pollinations.ai/");
-                        }
-                        HttpRequest req = rb.POST(HttpRequest.BodyPublishers.ofString(body)).build();
-                        response = HTTP_CLIENT.send(req, HttpResponse.BodyHandlers.ofString());
-                    } else {
-                        String full = systemPrompt + "\n\nЗАПРОС: " + prompt + "\nОТВЕЧАЙ ТОЛЬКО ЧИСТЫМ JSON!";
-                        String enc = java.net.URLEncoder.encode(full, java.nio.charset.StandardCharsets.UTF_8);
-                        HttpRequest req = HttpRequest.newBuilder()
-                                .uri(URI.create(p.url + enc + "?model=" + p.model + "&json=true&seed=" + System.nanoTime()))
-                                .header("User-Agent", "Mozilla/5.0")
-                                .timeout(Duration.ofSeconds(30))
-                                .GET().build();
-                        response = HTTP_CLIENT.send(req, HttpResponse.BodyHandlers.ofString());
+                String planJson = attemptProvider(state, p, systemPrompt, prompt);
+                if (planJson != null) {
+                    ParsedPlan plan = ActionParser.parse(planJson);
+                    if (plan.parsedSuccessfully && (!plan.blocks.isEmpty() || !plan.instantActions.isEmpty())) {
+                        state.log("§a✅ План готов! Блоков: " + plan.getTotalBlocks() + ", предметов: " + plan.getTotalItems());
+                        state.readyPlan = plan;
+                        state.requestInProgress = false;
+                        state.finishedSuccessfully = true;
+                        notifyDone();
+                        return;
                     }
-
-                    state.log("§7HTTP статус: " + response.statusCode());
-
-                    if (response.statusCode() == 200) {
-                        String content = response.body();
-                        state.log("§7Ответ " + content.length() + " байт");
-
-                        if (p.usePost && content.trim().startsWith("{")) {
-                            try {
-                                JsonObject obj = GSON.fromJson(content, JsonObject.class);
-                                if (obj.has("choices")) {
-                                    content = obj.getAsJsonArray("choices").get(0).getAsJsonObject()
-                                            .getAsJsonObject("message").get("content").getAsString();
-                                }
-                            } catch (Exception ignored) {}
-                        }
-
-                        content = content.trim()
-                                .replaceAll("^```json\\s*", "")
-                                .replaceAll("\\s*```$", "")
-                                .trim();
-
-                        int start = content.indexOf('{');
-                        int end = content.lastIndexOf('}');
-                        if (end > start && content.contains("\"actions\"")) {
-                            content = content.substring(start, end+1);
-                            state.log("§a✅ Найден валидный JSON с действиями!");
-                            ParsedPlan plan = ActionParser.parse(content);
-                            if (plan.parsedSuccessfully && (!plan.blocks.isEmpty() || !plan.instantActions.isEmpty())) {
-                                state.log("§a✅ План готов! Блоков: " + plan.getTotalBlocks() + ", предметов: " + plan.getTotalItems());
-                                state.readyPlan = plan;
-                                state.requestInProgress = false;
-                                state.finishedSuccessfully = true;
-                                notifyDone();
-                                return;
-                            } else {
-                                state.log("§cНет действий в плане");
-                            }
-                        } else {
-                            state.log("§cНет JSON с actions, превью: " + content.substring(0, Math.min(80, content.length())).replace("\n", " "));
-                        }
-                    }
-                    Thread.sleep(500);
-                } catch (Exception e) {
-                    state.log("§cОшибка: " + e.getMessage());
-                    LuggMod.LOGGER.warn("[FreeAI] {}: {}", p.name, e.getMessage());
+                    state.log("§cJSON получен, но план пустой или невалидный: " + shorten(plan.errorMessage, 100));
                 }
+                safeSleep(400);
             }
 
             if (ModConfig.getInstance().hasApiKey()) {
                 state.log("§eПробую OpenRouter с твоим ключом...");
                 OpenRouterClient.sendRequest(taskType, prompt, msg -> {
-                    MinecraftClient mc = MinecraftClient.getInstance();
+                    // Промежуточные статусы («Пробую модель…», 429 и т.д.) — только в лог
                     if (msg.startsWith("§a✅")) {
                         ParsedPlan plan = ActionParser.parse(msg.substring(3));
                         if (plan.parsedSuccessfully && (!plan.blocks.isEmpty() || !plan.instantActions.isEmpty())) {
@@ -155,13 +84,22 @@ public class FreeAiClient {
                             state.requestInProgress = false;
                             state.finishedSuccessfully = true;
                             notifyDone();
-                            return;
+                        } else {
+                            state.log("§cOpenRouter: JSON некорректен или план пустой");
+                            state.requestInProgress = false;
+                            state.failed = true;
+                            notifyFail();
                         }
+                        return;
                     }
-                    state.log("§cOpenRouter не сработал");
-                    state.requestInProgress = false;
-                    state.failed = true;
-                    notifyFail();
+                    if (msg.startsWith("§c❌")) {
+                        state.log(msg);
+                        state.requestInProgress = false;
+                        state.failed = true;
+                        notifyFail();
+                        return;
+                    }
+                    state.log(msg);
                 });
                 return;
             }
@@ -171,6 +109,129 @@ public class FreeAiClient {
             state.failed = true;
             notifyFail();
         }, "lugg-freeai").start();
+    }
+
+    /**
+     * Один провайдер: до 2 попыток (повтор на 429/5xx/сетевые сбои).
+     * Возвращает planJson при успехе либо null.
+     */
+    private static String attemptProvider(AiRequestState state, Provider p, String systemPrompt, String prompt) {
+        final int maxAttempts = 2;
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                HttpResponse<String> response = send(p, systemPrompt, prompt);
+                int status = response.statusCode();
+                String body = response.body() == null ? "" : response.body();
+                state.log("§7HTTP статус: " + status + (attempt > 1 ? " (повтор " + attempt + "/" + maxAttempts + ")" : ""));
+
+                // ---- 429 / rate limit: жду и повторяю тот же провайдер ----
+                boolean rate = status == 429 || AiResponseExtractor.looksLikeRateLimit(body);
+                if (rate) {
+                    long waitSec = Math.min(
+                            AiResponseExtractor.retryAfterSeconds(response, 3L * attempt),
+                            MAX_RATE_WAIT_SEC);
+                    state.log("§e⚠ 429 — лимит запросов, жду " + waitSec + "с и повторяю...");
+                    safeSleep(waitSec * 1000);
+                    continue; // следующая попытка того же провайдера
+                }
+
+                // ---- Временная ошибка сервера: один тихий повтор ----
+                if (status >= 500 && attempt < maxAttempts) {
+                    state.log("§e⚠ Сервер недоступен (" + status + "), повтор через 2с...");
+                    safeSleep(2000);
+                    continue;
+                }
+
+                if (status != 200) {
+                    state.log("§cОшибка провайдера: HTTP " + status + " " + shorten(body.replace('\n', ' '), 150));
+                    return null;
+                }
+
+                state.log("§7Ответ " + body.length() + " байт");
+
+                // ---- Полностью новый разбор ответа ИИ ----
+                AiResponseExtractor.Outcome outcome = AiResponseExtractor.extract(body);
+                if (outcome.note != null) {
+                    state.log("§7" + outcome.note);
+                }
+                if (outcome.isSuccess()) {
+                    state.log("§a✅ Найден JSON с действиями!");
+                    return outcome.planJson;
+                }
+
+                // Неудача разбора при HTTP 200
+                if (outcome.rateLimited) {
+                    long waitSec = Math.min(3L * attempt, MAX_RATE_WAIT_SEC);
+                    state.log("§e⚠ ИИ ответил про лимит запросов, жду " + waitSec + "с...");
+                    safeSleep(waitSec * 1000);
+                    continue;
+                }
+                state.log("§cРазбор не удался: " + shorten(outcome.error, 120));
+                if (outcome.note != null) state.log("§7" + shorten(outcome.note, 160));
+                return null; // 200 но мусор — повтор не поможет, идём к следующему
+
+            } catch (java.net.http.HttpTimeoutException te) {
+                state.log("§cТаймаут запроса" + (attempt < maxAttempts ? ", повторяю..." : ", нет ответа"));
+                if (attempt < maxAttempts) { safeSleep(1000); continue; }
+            } catch (Exception e) {
+                String msg = e.getMessage() != null && !e.getMessage().isBlank()
+                        ? e.getMessage()
+                        : e.getClass().getSimpleName();
+                state.log("§cОшибка: " + msg);
+                LuggMod.LOGGER.warn("[FreeAI] {} попытка {}: {}", p.name, attempt, msg, e);
+                if (attempt < maxAttempts) { safeSleep(1000); continue; }
+            }
+        }
+        return null;
+    }
+
+    private static HttpResponse<String> send(Provider p, String systemPrompt, String prompt) throws Exception {
+        if (p.usePost) {
+            List<Map<String, String>> messages = List.of(
+                    Map.of("role", "system", "content", systemPrompt),
+                    Map.of("role", "user", "content", prompt)
+            );
+            String body = GSON.toJson(Map.of(
+                    "model", p.model,
+                    "messages", messages,
+                    "stream", false,
+                    "temperature", 0.6,
+                    "max_tokens", 4096
+            ));
+            HttpRequest.Builder rb = HttpRequest.newBuilder()
+                    .uri(URI.create(p.url))
+                    .header("Content-Type", "application/json")
+                    .header("User-Agent", "Mozilla/5.0")
+                    .header("Accept", "application/json")
+                    .timeout(Duration.ofSeconds(45));
+            if (p.url.contains("omniroute.ai")) {
+                rb.header("Authorization", "Bearer omni-78c32bf3c1");
+            } else {
+                rb.header("Origin", "https://pollinations.ai").header("Referer", "https://pollinations.ai/");
+            }
+            HttpRequest req = rb.POST(HttpRequest.BodyPublishers.ofString(body)).build();
+            return HTTP_CLIENT.send(req, HttpResponse.BodyHandlers.ofString());
+        }
+
+        String full = systemPrompt + "\n\nЗАПРОС: " + prompt + "\nОТВЕЧАЙ ТОЛЬКО ЧИСТЫМ JSON!";
+        String enc = java.net.URLEncoder.encode(full, java.nio.charset.StandardCharsets.UTF_8);
+        HttpRequest req = HttpRequest.newBuilder()
+                .uri(URI.create(p.url + enc + "?model=" + p.model + "&json=true&seed=" + System.nanoTime()))
+                .header("User-Agent", "Mozilla/5.0")
+                .timeout(Duration.ofSeconds(40))
+                .GET().build();
+        return HTTP_CLIENT.send(req, HttpResponse.BodyHandlers.ofString());
+    }
+
+    private static void safeSleep(long ms) {
+        try { Thread.sleep(Math.max(0, ms)); }
+        catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+
+    private static String shorten(String s, int max) {
+        if (s == null) return "";
+        String t = s.replace('\n', ' ');
+        return t.length() > max ? t.substring(0, max) + "…" : t;
     }
 
     private static void notifyDone() {
@@ -193,6 +254,6 @@ public class FreeAiClient {
     private static class Provider {
         String name, url, model;
         boolean usePost;
-        Provider(String n, String u, String m, boolean post) { name=n; url=u; model=m; usePost=post; }
+        Provider(String n, String u, String m, boolean post) { name = n; url = u; model = m; usePost = post; }
     }
 }

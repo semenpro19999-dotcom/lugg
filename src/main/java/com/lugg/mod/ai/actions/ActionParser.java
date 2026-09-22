@@ -5,6 +5,7 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.google.gson.JsonSyntaxException;
 import com.lugg.mod.LuggMod;
+import com.lugg.mod.ai.AiResponseExtractor;
 import com.lugg.mod.ai.BlockNameFixer;
 import com.lugg.mod.ai.ItemNameFixer;
 import com.lugg.mod.ai.building.BuildManager;
@@ -12,13 +13,11 @@ import net.minecraft.client.MinecraftClient;
 import net.minecraft.text.Text;
 import net.minecraft.util.math.BlockPos;
 
-import java.util.Stack;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-
 /**
- * Очень устойчивый парсер ответа ИИ который вытаскивает JSON из любого текста,
- * даже если ИИ добавил объяснения до/после, использует кавычки-ёлочки, пропустил запятые и т.д.
+ * Парсер ответа ИИ в план действий.
+ * Весь «грязный» разбор сырого текста делегируется {@link AiResponseExtractor} —
+ * он вытаскивает JSON из любых ответов (обёртки, markdown, двойное кодирование,
+ * обрезанный JSON и т.д.), а здесь — семантика действий плана.
  */
 public class ActionParser {
 
@@ -32,26 +31,36 @@ public class ActionParser {
             return plan;
         }
 
-        String jsonStr = extractJsonObject(aiResponse);
+        String jsonStr = AiResponseExtractor.findPlanJson(aiResponse);
         if (jsonStr == null) {
-            plan.errorMessage = "ИИ не вернул план в формате JSON.";
+            String preview = aiResponse == null ? "" : aiResponse.replace('\n', ' ').trim();
+            if (preview.length() > 120) preview = preview.substring(0, 120) + "…";
+            plan.errorMessage = "ИИ не вернул план в формате JSON.\nПревью: " + preview;
             return plan;
         }
 
         try {
             JsonObject json = JsonParser.parseString(jsonStr).getAsJsonObject();
 
-            if (json.has("narration")) plan.narration = json.get("narration").getAsString();
-            if (json.has("build_name")) plan.buildName = json.get("build_name").getAsString();
+            if (json.has("narration") && json.get("narration").isJsonPrimitive()) {
+                plan.narration = json.get("narration").getAsString();
+            }
+            if (json.has("build_name") && json.get("build_name").isJsonPrimitive()) {
+                plan.buildName = json.get("build_name").getAsString();
+            }
 
-            // Фиксируем позицию игрока В МОМЕНТ ПАРСИНГА (т.е. после того как ИИ ответил, ровно там где стоит игрок)
+            // Позиция игрока в момент парсинга (план строится относительно неё)
             BlockPos buildOrigin = client.player.getBlockPos().add(0, 0, 2);
 
-            if (json.has("actions")) {
-                JsonArray actionsArr = json.getAsJsonArray("actions");
+            JsonArray actionsArr = json.has("actions") && json.get("actions").isJsonArray()
+                    ? json.getAsJsonArray("actions")
+                    : findActionsArrayFallback(json);
+
+            if (actionsArr != null) {
                 for (int i = 0; i < actionsArr.size(); i++) {
+                    if (!actionsArr.get(i).isJsonObject()) continue;
                     JsonObject act = actionsArr.get(i).getAsJsonObject();
-                    if (!act.has("type")) continue;
+                    if (!act.has("type") || !act.get("type").isJsonPrimitive()) continue;
                     String type = act.get("type").getAsString();
 
                     switch (type) {
@@ -80,7 +89,7 @@ public class ActionParser {
                                 int minZ = Math.min(z1, z2), maxZ = Math.max(z1, z2);
 
                                 // Ограничиваем максимальный размер чтобы не повесить игру
-                                int volume = (maxX-minX+1)*(maxY-minY+1)*(maxZ-minZ+1);
+                                int volume = (maxX - minX + 1) * (maxY - minY + 1) * (maxZ - minZ + 1);
                                 if (volume > 50000) {
                                     LuggMod.LOGGER.warn("Слишком большая fill область: {} блоков, ограничиваю", volume);
                                     maxY = minY + 30;
@@ -90,7 +99,7 @@ public class ActionParser {
                                     for (int by = minY; by <= maxY; by++) {
                                         for (int bz = minZ; bz <= maxZ; bz++) {
                                             plan.blocks.add(new BuildManager.BlockPlacement(
-                                                    new BlockPos(buildOrigin.getX()+bx, buildOrigin.getY()+by, buildOrigin.getZ()+bz),
+                                                    new BlockPos(buildOrigin.getX() + bx, buildOrigin.getY() + by, buildOrigin.getZ() + bz),
                                                     block));
                                         }
                                     }
@@ -103,12 +112,28 @@ public class ActionParser {
             }
 
             plan.parsedSuccessfully = true;
-        } catch (JsonSyntaxException | IllegalStateException e) {
+            if (plan.blocks.isEmpty() && plan.instantActions.isEmpty()) {
+                plan.errorMessage = "JSON получен, но действий внутри нет.";
+            }
+        } catch (JsonSyntaxException | IllegalStateException | ClassCastException e) {
             plan.errorMessage = "Ошибка разбора ответа ИИ: " + e.getMessage() + "\nПопробуй отправить запрос ещё раз.";
             LuggMod.LOGGER.error("[Parser] Ошибка парсинга JSON: {}", jsonStr, e);
         }
 
         return plan;
+    }
+
+    /** Если ключ называется иначе (steps/commands/…), найдём массив действий по полю type. */
+    private static JsonArray findActionsArrayFallback(JsonObject json) {
+        for (String key : new String[]{"steps", "commands", "plan", "build_actions", "task_actions"}) {
+            if (json.has(key) && json.get(key).isJsonArray()) {
+                JsonArray arr = json.getAsJsonArray(key);
+                for (int i = 0; i < arr.size(); i++) {
+                    if (arr.get(i).isJsonObject() && arr.get(i).getAsJsonObject().has("type")) return arr;
+                }
+            }
+        }
+        return null;
     }
 
     /**
@@ -162,14 +187,14 @@ public class ActionParser {
                     int y = act.has("y") ? act.get("y").getAsInt() : 0;
                     int z = act.has("z") ? act.get("z").getAsInt() : 0;
                     client.getNetworkHandler().sendChatCommand(String.format("summon %s %d %d %d",
-                            entity, a.origin.getX()+x, a.origin.getY()+y, a.origin.getZ()+z));
+                            entity, a.origin.getX() + x, a.origin.getY() + y, a.origin.getZ() + z));
                     yield 15L;
                 }
                 case "say", "voice", "narration" -> {
                     String text = act.get("text").getAsString().replace("\"", "");
                     if (text.length() > 200) text = text.substring(0, 200);
                     client.player.sendMessage(Text.literal("§d[Рассказчик] §f" + text), false);
-                    yield (long)Math.max(500, text.length() * 50);
+                    yield (long) Math.max(500, text.length() * 50);
                 }
                 case "title" -> {
                     String text = act.get("text").getAsString().replace("\"", "");
@@ -191,7 +216,7 @@ public class ActionParser {
                     double y = act.get("y").getAsDouble();
                     double z = act.get("z").getAsDouble();
                     net.minecraft.util.math.Vec3d pos = client.player.getPos();
-                    client.getNetworkHandler().sendChatCommand(String.format("tp @p %.1f %.1f %.1f", pos.x+x, pos.y+y, pos.z+z));
+                    client.getNetworkHandler().sendChatCommand(String.format("tp @p %.1f %.1f %.1f", pos.x + x, pos.y + y, pos.z + z));
                     yield 100L;
                 }
                 default -> 0L;
@@ -201,48 +226,4 @@ public class ActionParser {
             return 0;
         }
     }
-
-    /**
-     * Вытаскивает JSON объект из любого текста, даже если вокруг есть лишний текст.
-     * Умеет находить сбалансированные фигурные скобки, игнорирует ```json блоки.
-     */
-    private static String extractJsonObject(String text) {
-        // Сначала вырезаем ```json ... ```
-        Pattern codeBlock = Pattern.compile("```(?:json)?\\s*(\\{.*?})\\s*```", Pattern.DOTALL);
-        Matcher m = codeBlock.matcher(text);
-        if (m.find()) return m.group(1);
-
-        // Ищем первую { и соответствующую ей сбалансированную }
-        int start = text.indexOf('{');
-        if (start < 0) return null;
-
-        Stack<Character> stack = new Stack<>();
-        boolean inString = false;
-        boolean escaped = false;
-        for (int i = start; i < text.length(); i++) {
-            char c = text.charAt(i);
-            if (escaped) { escaped = false; continue; }
-            if (c == '\\') { escaped = true; continue; }
-            if (c == '"') inString = !inString;
-            if (inString) continue;
-
-            if (c == '{' || c == '[') stack.push(c);
-            else if (c == '}') {
-                if (stack.isEmpty() || stack.pop() != '{') break;
-                if (stack.isEmpty()) {
-                    // Нашли сбалансированный блок
-                    String candidate = text.substring(start, i+1);
-                    // Проверяем что это валидный JSON
-                    try {
-                        JsonParser.parseString(candidate);
-                        return candidate;
-                    } catch (Exception ignored) {}
-                }
-            } else if (c == ']') {
-                if (!stack.isEmpty() && stack.peek() == '[') stack.pop();
-            }
-        }
-        return null;
-    }
-
 }
