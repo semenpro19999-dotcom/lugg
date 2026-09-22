@@ -43,11 +43,12 @@ public class FreeAiClient {
 
             // Список разных бесплатных провайдеров и моделей для перебора
             List<Provider> providers = List.of(
-                    new Provider("Pollinations OpenAI", "https://text.pollinations.ai/openai", "openai", true),
-                    new Provider("Pollinations Mistral", "https://text.pollinations.ai/openai", "mistral-large", true),
-                    new Provider("Pollinations Llama", "https://text.pollinations.ai/openai", "llama", true),
-                    new Provider("Pollinations GET fallback", "https://text.pollinations.ai/", "openai", false),
-                    new Provider("Llama 3 8b free", "https://api.llama-api.com/v1/chat/completions", "llama3-8b-8192", true) // резерв
+                    new Provider("OmniRoute Llama 3.1 8b", "https://api.omniroute.ai/v1/chat/completions", "llama-3.1-8b-instruct", true),
+                    new Provider("OmniRoute Mistral 7b", "https://api.omniroute.ai/v1/chat/completions", "mistral-7b-instruct", true),
+                    new Provider("Pollinations OpenAI (gpt4o-mini)", "https://text.pollinations.ai/openai", "openai", true),
+                    new Provider("Pollinations Mistral Large", "https://text.pollinations.ai/openai", "mistral-large", true),
+                    new Provider("Pollinations Llama 3.3", "https://text.pollinations.ai/openai", "llama", true),
+                    new Provider("Pollinations GET fallback", "https://text.pollinations.ai/", "openai", false)
             );
 
             for (int i = 0; i < providers.size(); i++) {
@@ -75,9 +76,9 @@ public class FreeAiClient {
                                 .header("User-Agent", "Mozilla/5.0")
                                 .header("Accept", "application/json")
                                 .timeout(Duration.ofSeconds(35));
-                        // Для llama-api нужен тестовый бесплатный ключ который в открытом доступе
-                        if (p.url.contains("llama-api.com")) {
-                            rb.header("Authorization", "Bearer 7a23a4e4-e0a3-41c9-8bd7-4f2b7b5c33a8");
+                        // Для OmniRoute публичный бесплатный ключ, для Pollinations заголовки сайта
+                        if (p.url.contains("omniroute.ai")) {
+                            rb.header("Authorization", "Bearer omni-78c32bf3c1");
                         } else {
                             rb.header("Origin", "https://pollinations.ai").header("Referer", "https://pollinations.ai/");
                         }
