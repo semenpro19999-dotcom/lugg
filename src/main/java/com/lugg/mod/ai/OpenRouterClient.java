@@ -3,6 +3,7 @@ package com.lugg.mod.ai;
 import com.google.gson.Gson;
 import com.lugg.mod.config.ModConfig;
 import com.lugg.mod.LuggMod;
+import com.lugg.mod.client.AiRequestState;
 
 import java.net.URI;
 import java.net.http.HttpClient;
